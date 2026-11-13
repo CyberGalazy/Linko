@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "LinkedIn → X DMs (local)",
+  "version": "8.0",
+  "description": "Personal helper: messages your LinkedIn connections an invite to connect on X. Runs only on the connections page.",
+  "content_scripts": [
+    {
+      "matches": ["https://www.linkedin.com/mynetwork/invite-connect/connections/*"],
+      "js": ["flag.js", "linkedin_dm.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

@@ -43,7 +43,7 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v8';
+  const VERSION = 'v9';
   console.log('%c[DM]', 'color:#0a66c2;font-weight:bold', `linkedin_dm.js ${VERSION} loaded${window.__DM_EXT ? ' (extension)' : ' (pasted)'}`);
   if (window.DM && window.DM.running) { console.warn('DM already running. DM.stop() first.'); return; }
 
@@ -140,8 +140,14 @@ Here's my profile: https://x.com/Gauransh20`,
   // ------------------------- rate-limit watcher ---------------------------
   // LinkedIn answers "429 Too Many Requests" when you go too fast. We watch for it
   // three ways (resource timing, fetch, XHR) and pause the run when it happens.
-  const rl = { hits: [], installed: false, po: null, origFetch: null, origOpen: null };
+  const rl = { hits: [], sends: [], installed: false, po: null, origFetch: null, origOpen: null };
   const note429 = url => { if (/\/voyager\//.test(url || '')) rl.hits.push(Date.now()); };
+  // A 2xx POST to LinkedIn's messaging API = proof a message actually went out.
+  const noteSend = (method, url, status) => {
+    if (/^post$/i.test(method || '') && /\/voyager\//.test(url || '') && /messag/i.test(url || '') &&
+        status >= 200 && status < 300) rl.sends.push(Date.now());
+  };
+  const sentSince = t => rl.sends.some(x => x >= t);
   function installRateWatch() {
     if (rl.installed) return;
     rl.installed = true;
@@ -154,11 +160,12 @@ Here's my profile: https://x.com/Gauransh20`,
     rl.origFetch = window.fetch;
     window.fetch = function (...args) {
       const url = String((args[0] && args[0].url) || args[0]);
-      return rl.origFetch.apply(this, args).then(r => { if (r.status === 429) note429(url); return r; });
+      const method = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
+      return rl.origFetch.apply(this, args).then(r => { if (r.status === 429) note429(url); noteSend(method, url, r.status); return r; });
     };
     rl.origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, url, ...rest) {
-      this.addEventListener('loadend', () => { if (this.status === 429) note429(String(url)); });
+      this.addEventListener('loadend', () => { if (this.status === 429) note429(String(url)); noteSend(m, String(url), this.status); });
       return rl.origOpen.call(this, m, url, ...rest);
     };
   }
@@ -341,18 +348,31 @@ Here's my profile: https://x.com/Gauransh20`,
     }
 
     const send = await waitFor(() => findSend(scope), 4000);
+    const tSend = Date.now();
     if (send) realClick(send);
     else box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, composed: true }));
 
-    const ok = await waitFor(() => !boxText(box).includes(CONFIG.FINGERPRINT) &&
-                                   scope.innerText.includes(CONFIG.FINGERPRINT), 15000);
+    // LinkedIn often swaps the "new message" pop-up for a fresh conversation pop-up after the
+    // first send, detaching our box/scope — so check live pop-ups too, and the network.
+    const FP = CONFIG.FINGERPRINT;
+    const liveScopes = () => scope.isConnected ? [scope] : [...new Set([...bubbles(), ...allBoxes(true).map(scopeOf)])];
+    const leftComposer = () => !box.isConnected || !boxText(box).includes(FP);
+    const inThread = sc => {
+      let t = sc.innerText || '';
+      for (const b of sc.querySelectorAll(BOX_SEL)) t = t.replace(b.innerText || '', '');
+      return t.includes(FP);
+    };
+    const confirmed = await waitFor(() => sentSince(tSend) ? 'network'
+      : (leftComposer() && liveScopes().some(inThread)) ? 'dom' : null, 15000, 250);
     // A failed message still shows in the thread, so watch a few seconds for LinkedIn's failure marker.
-    const failed = await waitFor(() => !failedBefore && sendFailedIn(scope), ok ? 3500 : 1000, 250);
-    if (failed) { await closeBubble(scope); throw Object.assign(new Error('LinkedIn failed to send'), { sendFailed: true }); }
-    if (!ok) throw new Error('could not confirm the message was sent');
+    const failed = await waitFor(() => scope.isConnected ? (!failedBefore && sendFailedIn(scope))
+      : liveScopes().some(sendFailedIn), confirmed ? 3500 : 1500, 250);
+    const closeLive = async () => { for (const sc of liveScopes()) await closeBubble(sc); };
+    if (failed) { await closeLive(); throw Object.assign(new Error('LinkedIn failed to send'), { sendFailed: true }); }
+    if (!confirmed && !leftComposer()) throw new Error('could not confirm the message was sent (text still in the box)');
     await sleep(rand(300, 800));
-    await closeBubble(scope);
-    return 'sent';
+    await closeLive();
+    return confirmed ? 'sent' : 'sent (unconfirmed)';
   }
 
   // ---------------------------- scrolling ---------------------------------
@@ -581,13 +601,13 @@ Here's my profile: https://x.com/Gauransh20`,
           say(`→ ${card.name} (${card.text})`);
           try {
             const status = await messageCard(card);
-            if (status === 'sent') { sendFails = 0; sinceBreak++; if (run.rateBreaks) { run.rateBreaks = 0; saveRun(run); } }
+            if (status.startsWith('sent')) { sendFails = 0; sinceBreak++; if (run.rateBreaks) { run.rateBreaks = 0; saveRun(run); } }
             say(`   ✓ ${status}`);
             if (status !== 'dry-run') {
               log[card.url] = { name: card.name, connected: card.date.toISOString().slice(0, 10), status, at: new Date().toISOString() };
               saveLog(log);
             }
-            if (status === 'sent' || status === 'dry-run') { count++; if (status === 'sent') sent++; }
+            if (status.startsWith('sent') || status === 'dry-run') { count++; if (status.startsWith('sent')) sent++; }
             if (status !== 'dry-run') bookmark(card, true);
           } catch (e) {
             if (e.rate || e.nobox || rateLimited()) {

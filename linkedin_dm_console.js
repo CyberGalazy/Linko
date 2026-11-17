@@ -14,7 +14,6 @@
 `Hey! Would love to connect on X (Twitter) as well. Always great to connect with like-minded people, share ideas and engage in interesting discussions.
 
 Here's my profile: https://x.com/Gauransh20`,
-    FINGERPRINT: 'x.com/Gauransh20',   // used to detect "already sent" in a thread
     START_DATE: '2026-10-28',          // message people connected ON or BEFORE this date
     START_NAME: '',                        // start at this person (exact name; skip those above). '' = no name filter
     BETWEEN: [45, 90],                 // seconds per DM (start to start), random
@@ -27,11 +26,12 @@ Here's my profile: https://x.com/Gauransh20`,
   // ========================================================================
 
   const LOG_KEY = 'dmXLog';
-  const SET_KEY = 'dmXSettings';        // what you type in the panel: { startName, startDate, startUrl, after }
+  const SET_KEY = 'dmXSettings';        // what you type in the panel: { message, startName, startDate, startUrl, after }
   function settings() {
     let v = {};
     try { v = JSON.parse(localStorage.getItem(SET_KEY)) || {}; } catch {}
     return {
+      message: typeof v.message === 'string' && v.message.trim() ? v.message : CONFIG.MESSAGE,
       startName: typeof v.startName === 'string' ? v.startName : CONFIG.START_NAME,
       startDate: v.startDate || CONFIG.START_DATE,
       startUrl: v.startUrl || '',     // bookmark: exact profile URL of the start person
@@ -39,11 +39,19 @@ Here's my profile: https://x.com/Gauransh20`,
     };
   }
   const saveSettings = v => localStorage.setItem(SET_KEY, JSON.stringify(v));
+  // Text used to recognise "already sent" in a thread: the first link in the message
+  // (without https://), else its longest line (max 40 chars).
+  function fingerprint(msg = settings().message) {
+    const url = (msg.match(/https?:\/\/\S+/) || [])[0];
+    if (url) return url.replace(/^https?:\/\//, '').replace(/[).,!?]+$/, '');
+    const line = msg.split('\n').map(l => l.trim()).sort((a, b) => b.length - a.length)[0] || '';
+    return line.slice(0, 40);
+  }
   let START = new Date(settings().startDate + 'T23:59:59');
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v9';
+  const VERSION = 'v10';
   console.log('%c[DM]', 'color:#0a66c2;font-weight:bold', `linkedin_dm.js ${VERSION} loaded${window.__DM_EXT ? ' (extension)' : ' (pasted)'}`);
   if (window.DM && window.DM.running) { console.warn('DM already running. DM.stop() first.'); return; }
 
@@ -258,9 +266,10 @@ Here's my profile: https://x.com/Gauransh20`,
 
   const GREETINGS = ['Hey!', 'Hi!', 'Hey there!', 'Hi there!'];
   function messageText() {
-    if (!CONFIG.VARY_GREETING) return CONFIG.MESSAGE;
+    const msg = settings().message;
+    if (!CONFIG.VARY_GREETING) return msg;
     const g = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
-    return CONFIG.MESSAGE.replace(/^(Hey|Hi)( there)?!/, g);
+    return msg.replace(/^(Hey|Hi)( there)?!/, g);
   }
 
   const FAIL_RE = /failed to send|couldn['’]t send|could not send|message not sent|not delivered|unable to send/i;
@@ -280,7 +289,7 @@ Here's my profile: https://x.com/Gauransh20`,
     dt.setData('text/plain', text);
     box.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true, composed: true }));
     await sleep(400);
-    if (boxText(box).includes(CONFIG.FINGERPRINT)) return true;
+    if (boxText(box).includes(fingerprint())) return true;
 
     // Fallback: insert line by line (Chrome fires real input events for execCommand)
     clearBox(box);
@@ -290,7 +299,7 @@ Here's my profile: https://x.com/Gauransh20`,
       if (i < lines.length - 1) doc.execCommand('insertParagraph', false, null);
     });
     await sleep(300);
-    return boxText(box).includes(CONFIG.FINGERPRINT);
+    return boxText(box).includes(fingerprint());
   }
 
   function checkBlocks() {
@@ -333,7 +342,7 @@ Here's my profile: https://x.com/Gauransh20`,
     const { scope, box } = result;
     await sleep(rand(400, 900)); // let the thread load
     const threadText = scope.innerText.replace(boxText(box), '');
-    if (threadText.includes(CONFIG.FINGERPRINT) && !sendFailedIn(scope)) { await closeBubble(scope); return 'skipped-existing'; }
+    if (threadText.includes(fingerprint()) && !sendFailedIn(scope)) { await closeBubble(scope); return 'skipped-existing'; }
     const failedBefore = sendFailedIn(scope);
 
     if (!(await pasteMessage(box))) throw new Error('could not insert message text');
@@ -354,7 +363,7 @@ Here's my profile: https://x.com/Gauransh20`,
 
     // LinkedIn often swaps the "new message" pop-up for a fresh conversation pop-up after the
     // first send, detaching our box/scope — so check live pop-ups too, and the network.
-    const FP = CONFIG.FINGERPRINT;
+    const FP = fingerprint();
     const liveScopes = () => scope.isConnected ? [scope] : [...new Set([...bubbles(), ...allBoxes(true).map(scopeOf)])];
     const leftComposer = () => !box.isConnected || !boxText(box).includes(FP);
     const inThread = sc => {
@@ -419,26 +428,42 @@ Here's my profile: https://x.com/Gauransh20`,
   function buildPanel() {
     const inp = 'display:block;width:100%;box-sizing:border-box;margin:2px 0 6px;padding:4px 6px;border-radius:4px;border:1px solid #444;background:#222;color:#fff;font:12px system-ui;color-scheme:dark';
     const btn = 'margin-top:6px;margin-right:6px;color:#fff;border:0;border-radius:4px;padding:4px 10px;cursor:pointer';
+    ui.msg = el('textarea', { id: 'dm-x-msg', rows: 6, style: inp + ';resize:vertical;white-space:pre-wrap;font:12px/1.35 system-ui' });
+    ui.fp = el('div', { style: 'opacity:.5;font-size:10px;margin:-4px 0 6px;word-break:break-all' });
+    ui.reset = el('a', { href: '#', textContent: 'reset', style: 'float:right;color:#8ab4f8;font-size:11px' });
     ui.name = el('input', { id: 'dm-x-name', type: 'text', placeholder: 'e.g. Jane Doe (blank = first on/before date)', style: inp });
     ui.date = el('input', { id: 'dm-x-date', type: 'date', style: inp });
     ui.text = el('div', { id: 'dm-x-text' });
     ui.start = el('button', { id: 'dm-x-start', type: 'button', textContent: 'Start', style: btn + ';background:#2e7d32' });
     ui.stop = el('button', { id: 'dm-x-stop', type: 'button', textContent: 'Stop', style: btn + ';background:#c62828' });
     const form = el('div', { id: 'dm-x-form', style: 'margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333' }, [
+      el('div', { style: 'opacity:.75' }, [ui.reset, 'Message']), ui.msg, ui.fp,
       el('div', { textContent: 'Start from (name)', style: 'opacity:.75' }), ui.name,
       el('div', { textContent: 'Connected on/before', style: 'opacity:.75' }), ui.date,
     ]);
     const ver = el('div', { textContent: VERSION, style: 'position:absolute;top:4px;right:8px;opacity:.4;font-size:10px' });
     ui.panel = el('div', { id: 'dm-x-panel',
-      style: 'position:fixed;left:12px;bottom:12px;z-index:99999;background:#111;color:#fff;font:12px/1.4 system-ui;padding:10px 12px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.3);width:260px' },
+      style: 'position:fixed;left:12px;bottom:12px;z-index:99999;background:#111;color:#fff;font:12px/1.4 system-ui;padding:10px 12px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.3);width:300px;max-height:90vh;overflow:auto' },
       [ver, form, ui.text, ui.start, ui.stop]);
     document.body.appendChild(ui.panel);
 
     const st = settings();
+    ui.msg.value = st.message;
+    const showFp = () => { ui.fp.textContent = 'already-sent check: ' + (fingerprint(ui.msg.value) || '(empty)'); };
+    showFp();
+    // Message edits are saved on their own, so they don't reset the start-name bookmark.
+    ui.msg.addEventListener('input', () => { saveSettings({ ...settings(), message: ui.msg.value }); showFp(); });
+    ui.reset.addEventListener('click', e => {
+      e.preventDefault();
+      if (ui.msg.disabled) return;
+      ui.msg.value = CONFIG.MESSAGE;
+      saveSettings({ ...settings(), message: '' });
+      showFp();
+    });
     ui.name.value = st.startName || '';
     ui.date.value = st.startDate || '';
     // Typing a name by hand means "start AT this person" — drop the auto bookmark.
-    const store = () => saveSettings({ startName: ui.name.value.trim(), startDate: ui.date.value || CONFIG.START_DATE, startUrl: '', after: false });
+    const store = () => saveSettings({ ...settings(), startName: ui.name.value.trim(), startDate: ui.date.value || CONFIG.START_DATE, startUrl: '', after: false });
     ui.name.addEventListener('input', store);
     ui.name.addEventListener('change', store);
     ui.date.addEventListener('change', store);
@@ -454,7 +479,7 @@ Here's my profile: https://x.com/Gauransh20`,
     for (const t of ['keydown', 'keypress', 'keyup'])  // (not 'input' — we need that one ourselves)
       window.addEventListener(t, e => {
         const id = e.target && e.target.id;
-        if (id === 'dm-x-name' || id === 'dm-x-date') e.stopImmediatePropagation();
+        if (id === 'dm-x-name' || id === 'dm-x-date' || id === 'dm-x-msg') e.stopImmediatePropagation();
       }, true);
   }
   function panel(text) {
@@ -470,7 +495,7 @@ Here's my profile: https://x.com/Gauransh20`,
     });
   }
   function lockForm(on) {
-    for (const e of [ui.name, ui.date, ui.start]) {
+    for (const e of [ui.msg, ui.name, ui.date, ui.start]) {
       if (e) { e.disabled = on; e.style.opacity = on ? '.5' : '1'; }
     }
   }
@@ -486,6 +511,7 @@ Here's my profile: https://x.com/Gauransh20`,
 
     async start() {
       if (this.running) return say('Already running.');
+      if (ui.msg && !ui.msg.value.trim()) { panel('Type a message first.'); return say('Type a message first.'); }
       this.running = true;
       const log = loadLog();
       const tried = new Set();

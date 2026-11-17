@@ -53,7 +53,7 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v14.1';
+  const VERSION = 'v14.2';
   const MEM_RELOAD_EVERY = 40;          // reload the page after this many sends to free memory
   const heap = () => (performance.memory ? performance.memory : null);
   const heapMB = () => { const m = heap(); return m ? Math.round(m.usedJSHeapSize / 1048576) : 0; };
@@ -511,24 +511,44 @@ Here's my profile: https://x.com/Gauransh20`,
     }
     return out;
   }
-  // Paste the whole query at once (a single search request), then wait for the results to settle.
-  async function runSearch(q) {
+  const fold = x => (x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const nameMatches = (c, q) => fold(c.name).includes(fold(q));
+  const sigOf = () => resultCards().map(c => c.url).join('|');
+  const emptyShown = () => /no results|no connections found|didn['’]t find|no matching/i.test((document.querySelector('main') || document.body).innerText.slice(0, 20000));
+  // Put the whole query in at once (a single search request), then wait until LinkedIn has
+  // actually replaced the list (it can take a while) and the results have settled.
+  // Returns true (loaded), false (no search box) or 'timeout'.
+  async function runSearch(q, onWait) {
     const box = findSearchBox();
     if (!box) return false;
-    realClick(box); box.focus();
-    await sleep(rand(300, 600));
-    setInputValue(box, q);
-    await sleep(800);
-    let sig = '', stableSince = Date.now();
-    const end = Date.now() + 8000;
-    while (Date.now() < end) {
-      const now = resultCards().map(c => c.url).join('|');
-      if (now !== sig) { sig = now; stableSince = Date.now(); }
-      else if (Date.now() - stableSince > 1500) break;
-      await sleep(300);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const before = sigOf();
+      realClick(box); box.focus();
+      await sleep(rand(300, 600));
+      if (attempt === 2 || box.value === q) { setInputValue(box, ''); await sleep(rand(400, 800)); }
+      setInputValue(box, q);
+      const loaded = await waitFor(() => {
+        if (onWait) onWait();
+        const cards = resultCards(), sig = cards.map(c => c.url).join('|');
+        if (sig !== before) return true;
+        if (cards.length && cards.every(c => nameMatches(c, q))) return true;
+        return emptyShown();
+      }, 25000, 400);
+      if (loaded) {
+        let sig = sigOf(), stableSince = Date.now();
+        const end = Date.now() + 10000;
+        while (Date.now() < end && Date.now() - stableSince < 2000) {
+          await sleep(300);
+          const now = sigOf();
+          if (now !== sig) { sig = now; stableSince = Date.now(); }
+        }
+        return true;
+      }
+      if (attempt === 1) say(`   results for "${q}" didn't load — retrying once`);
     }
-    return true;
+    return 'timeout';
   }
+
 
   // ------------------------------ panel -----------------------------------
   // Built with createElement only — LinkedIn sanitizes innerHTML and strips <input>s.
@@ -736,15 +756,23 @@ Here's my profile: https://x.com/Gauransh20`,
             if (curQuery !== q) {
               setQuery(q);
               panel(`Searching "${q}" (${Math.min(qIdx + 1, QUERIES.length)}/${QUERIES.length})<br>sent ${sent}`);
-              if (!(await runSearch(q))) { say('🛑 Search box disappeared — reload the page.'); break; }
+              const r = await runSearch(q, () => panel(`Waiting for "${q}" results…<br>sent ${sent}`));
+              if (!r) { say('🛑 Search box disappeared — reload the page.'); break; }
               curQuery = q; scrollRounds = 0;
-              const n = resultCards().length;
-              say(`search "${q}": ${n} shown`);
+              if (r === 'timeout') {
+                say(`   "${q}" never loaded — skipping to the next search`);
+                if (extraFirst) extraFirst = null; else qIdx++;
+                await pauseFor(rand(5000, 9000), 'Next search');
+                continue;
+              }
+              const shown = resultCards();
+              say(`search "${q}": ${shown.length} shown, ${shown.filter(c => nameMatches(c, q)).length} matching`);
             }
-            const list = resultCards().filter(c => !tried.has(c.url) && !log[c.url] && (!c.date || c.date <= START));
+            // Only people whose name contains the letters — never someone from a stale/unfiltered list.
+            const list = resultCards().filter(c => nameMatches(c, q) && !tried.has(c.url) && !log[c.url] && (!c.date || c.date <= START));
             if (!list.length) {
               // Long result list? Scroll inside it a little (max 5 rounds), then go to the next query.
-              if (scrollRounds < 5 && resultCards().length >= 10) {
+              if (scrollRounds < 5 && resultCards().filter(c => nameMatches(c, q)).length >= 10) {
                 scrollRounds++;
                 if (await loadMore(false)) continue;
               }

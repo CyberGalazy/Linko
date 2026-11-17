@@ -51,7 +51,13 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v10';
+  const VERSION = 'v11';
+  const MEM_RELOAD_EVERY = 40;          // reload the page after this many sends to free memory
+  const heap = () => (performance.memory ? performance.memory : null);
+  const heapMB = () => { const m = heap(); return m ? Math.round(m.usedJSHeapSize / 1048576) : 0; };
+  const heapHigh = () => { const m = heap(); return !!m && m.usedJSHeapSize > 0.6 * m.jsHeapSizeLimit; };
+  // Let Chrome skip layout/paint for cards we've already passed (style only — safe for LinkedIn's React).
+  const lighten = el => { if (el && !el.style.contentVisibility) { el.style.contentVisibility = 'auto'; el.style.containIntrinsicSize = 'auto 120px'; } };
   console.log('%c[DM]', 'color:#0a66c2;font-weight:bold', `linkedin_dm.js ${VERSION} loaded${window.__DM_EXT ? ' (extension)' : ' (pasted)'}`);
   if (window.DM && window.DM.running) { console.warn('DM already running. DM.stop() first.'); return; }
 
@@ -115,16 +121,23 @@ Here's my profile: https://x.com/Gauransh20`,
       if (n.parentElement && n.parentElement.closest('#dm-x-panel, .msg-overlay-container, script, style')) continue;
       let el = n.parentElement;
       for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
-        const t = (el.innerText || '').trim();
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();   // textContent: no forced layout
         if (/^Connected\b/i.test(t) && parseConnected(t)) { out.push(el); break; }
       }
     }
     return [...new Set(out)];
   }
 
+  // Parsed cards are cached per label element, so we don't re-read hundreds of cards every loop.
+  let cardCache = new WeakMap();
   function getCards() {
     const cards = [], seen = new Set();
     for (const label of connectedLabels()) {
+      const hit = cardCache.get(label);
+      if (hit && hit.el.isConnected && hit.msg.isConnected) {
+        if (!seen.has(hit.url)) { seen.add(hit.url); cards.push(hit); }
+        continue;
+      }
       let el = label.parentElement;
       for (let i = 0; i < 15 && el; i++, el = el.parentElement) {
         const link = el.querySelector('a[href*="/in/"]');
@@ -136,7 +149,9 @@ Here's my profile: https://x.com/Gauransh20`,
             let name = (link.innerText || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
             if (!name) name = (msg.getAttribute('aria-label') || '').replace(/^(send a )?message( to)?\s*/i, '');
             const text = label.innerText.trim();
-            cards.push({ el, msg, url, name, text, date: parseConnected(text) });
+            const card = { el, msg, url, name, text, date: parseConnected(text) };
+            cardCache.set(label, card);
+            cards.push(card);
           }
           break;
         }
@@ -190,11 +205,34 @@ Here's my profile: https://x.com/Gauransh20`,
   // LinkedIn's redesigned pages render the chat pop-up inside a shadow DOM (and
   // sometimes a same-origin iframe), which plain document.querySelectorAll can't
   // see. These helpers search all of them.
+  // Chat pop-ups never live inside the connections list, so skip that (huge) subtree.
+  // The list = closest common ancestor of the first and last card (never the page-level scroller,
+  // which may also hold the chat pop-ups).
+  let _list = null, _listAt = 0;
+  function listRoot() {
+    if (_list && _list.isConnected && Date.now() - _listAt < 10000) return _list;
+    _list = null; _listAt = Date.now();
+    const labels = connectedLabels();
+    if (labels.length < 2) return null;
+    let a = labels[0];
+    const z = labels[labels.length - 1];
+    while (a && !a.contains(z)) a = a.parentElement;
+    if (!a || a === document.body || a === document.documentElement || a.querySelector('[contenteditable], #dm-x-panel')) return null;
+    return (_list = a);
+  }
+  function elementsOf(r) {
+    const skip = r === document ? listRoot() : null;
+    if (!skip) return r.querySelectorAll('*');
+    const out = [], w = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT,
+      { acceptNode: n => n === skip ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+    let n; while ((n = w.nextNode())) out.push(n);
+    return out;
+  }
   function scanRoots() {
     const out = [document], stack = [document];
     while (stack.length) {
       const r = stack.pop();
-      for (const el of r.querySelectorAll('*')) {
+      for (const el of elementsOf(r)) {
         if (el.shadowRoot) { out.push(el.shadowRoot); stack.push(el.shadowRoot); }
         if (el.tagName === 'IFRAME') {
           try { const d = el.contentDocument; if (d && d.body) { out.push(d); stack.push(d); } } catch { /* cross-origin */ }
@@ -205,7 +243,8 @@ Here's my profile: https://x.com/Gauransh20`,
   }
   let _roots = null, _rootsAt = 0;
   function allRoots(fresh) {
-    if (fresh || !_roots || Date.now() - _rootsAt > 1500) { _roots = scanRoots(); _rootsAt = Date.now(); }
+    const age = Date.now() - _rootsAt;   // full rescans at most once a second, otherwise every 5 s
+    if (!_roots || age > 5000 || (fresh && age > 1000)) { _roots = scanRoots(); _rootsAt = Date.now(); }
     return _roots;
   }
   const deepAll = (sel, fresh) => allRoots(fresh).flatMap(r => [...r.querySelectorAll(sel)]);
@@ -527,11 +566,12 @@ Here's my profile: https://x.com/Gauransh20`,
       let startReached = !START_NAME;
       // Move the "Start from" bookmark as we go, so a reload / restart continues from here.
       const bookmark = (c, after) => {
+        lighten(c.el);
         saveSettings({ ...settings(), startName: c.name, startUrl: c.url, after });
         if (ui.name) ui.name.value = c.name;
       };
       panel('Starting…'); lockForm(true);
-      let sinceBreak = 0, reloading = false;
+      let sinceBreak = 0, reloading = false, sentThisPage = 0;
       const run = loadRun();
       run.running = true; run.rateBreaks = run.rateBreaks || 0;
       saveRun(run);
@@ -539,7 +579,7 @@ Here's my profile: https://x.com/Gauransh20`,
         const end = Date.now() + ms;
         while (this.running && Date.now() < end) {
           const left = Math.ceil((end - Date.now()) / 1000);
-          panel(`${label}<br>resuming in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} · sent ${sent}`);
+          panel(`${label}<br>resuming in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} · sent ${sent}${heapMB() ? ' · ' + heapMB() + ' MB' : ''}`);
           await sleep(1000);
         }
       };
@@ -588,6 +628,16 @@ Here's my profile: https://x.com/Gauransh20`,
           const block = checkBlocks();
           if (block) { say('🛑 STOP —', block); break; }
           if (rateLimited()) { const r = await rateBreak(); if (r !== 'continue') break; continue; }
+          // Free memory: reload (and resume after the last person) every N sends or when the heap gets big.
+          if (FROM_EXT && (sentThisPage >= MEM_RELOAD_EVERY || heapHigh())) {
+            say(`🧹 Refreshing the page to free memory (${heapMB()} MB, ${sentThisPage} sent on this page)…`);
+            panel('🧹 Refreshing the page to free memory…');
+            await closeAllBubbles();
+            saveRun({ ...loadRun(), running: true, resumeAt: 0 });
+            reloading = true;
+            setTimeout(() => location.reload(), 300);
+            break;
+          }
 
           const cards = getCards();
           if (!startReached) {
@@ -599,6 +649,7 @@ Here's my profile: https://x.com/Gauransh20`,
                 break;
               }
               tried.add(c.url);   // above the start person — skip
+              lighten(c.el);
             }
           }
           const card = !startReached ? null : cards.find(c => !tried.has(c.url) && !log[c.url] && eligible(c));
@@ -633,7 +684,7 @@ Here's my profile: https://x.com/Gauransh20`,
               log[card.url] = { name: card.name, connected: card.date.toISOString().slice(0, 10), status, at: new Date().toISOString() };
               saveLog(log);
             }
-            if (status.startsWith('sent') || status === 'dry-run') { count++; if (status.startsWith('sent')) sent++; }
+            if (status.startsWith('sent') || status === 'dry-run') { count++; if (status.startsWith('sent')) { sent++; sentThisPage++; } }
             if (status !== 'dry-run') bookmark(card, true);
           } catch (e) {
             if (e.rate || e.nobox || rateLimited()) {

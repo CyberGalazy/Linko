@@ -51,7 +51,7 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v11';
+  const VERSION = 'v12';
   const MEM_RELOAD_EVERY = 40;          // reload the page after this many sends to free memory
   const heap = () => (performance.memory ? performance.memory : null);
   const heapMB = () => { const m = heap(); return m ? Math.round(m.usedJSHeapSize / 1048576) : 0; };
@@ -134,7 +134,8 @@ Here's my profile: https://x.com/Gauransh20`,
     const cards = [], seen = new Set();
     for (const label of connectedLabels()) {
       const hit = cardCache.get(label);
-      if (hit && hit.el.isConnected && hit.msg.isConnected) {
+      if (hit && hit.el.isConnected && hit.msg.isConnected && hit.link.isConnected &&
+          normUrl(hit.link.getAttribute('href')) === hit.url && label.textContent === hit.labelText) {
         if (!seen.has(hit.url)) { seen.add(hit.url); cards.push(hit); }
         continue;
       }
@@ -149,7 +150,7 @@ Here's my profile: https://x.com/Gauransh20`,
             let name = (link.innerText || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
             if (!name) name = (msg.getAttribute('aria-label') || '').replace(/^(send a )?message( to)?\s*/i, '');
             const text = label.innerText.trim();
-            const card = { el, msg, url, name, text, date: parseConnected(text) };
+            const card = { el, msg, url, name, text, date: parseConnected(text), link, labelText: label.textContent };
             cardCache.set(label, card);
             cards.push(card);
           }
@@ -437,9 +438,15 @@ Here's my profile: https://x.com/Gauransh20`,
     return (_scroller = document.scrollingElement || document.documentElement);
   }
 
-  async function loadMore(fast) {
+  async function loadMore(fast, nudge) {
     const sc = scroller();
-    const before = sc.scrollHeight, beforeCards = getCards().length;
+    const first = getCards();
+    const before = sc.scrollHeight, beforeCards = first.length;
+    const beforeLast = first.length ? first[first.length - 1].url : '';
+    if (nudge) {   // scroll up a bit and back down so LinkedIn's "load more" trigger fires again
+      sc.scrollBy({ top: -rand(600, 1000), behavior: 'smooth' });
+      await sleep(rand(600, 1000));
+    }
     for (let i = 0; i < 3; i++) {
       sc.scrollBy({ top: fast ? rand(1000, 1600) : rand(500, 900), behavior: 'smooth' });
       await sleep(fast ? rand(150, 300) : rand(300, 700));
@@ -450,7 +457,9 @@ Here's my profile: https://x.com/Gauransh20`,
     const more = deepAll('button').find(b => visible(b) && /show more results|load more|see more/i.test(b.innerText || ''));
     if (more) { realClick(more); await sleep(fast ? rand(900, 1400) : rand(1500, 2500)); }
     else await sleep(fast ? rand(600, 1000) : rand(1000, 1800));
-    return scroller().scrollHeight > before || getCards().length > beforeCards || !!more;
+    const after = getCards();
+    const afterLast = after.length ? after[after.length - 1].url : '';
+    return scroller().scrollHeight > before || after.length > beforeCards || afterLast !== beforeLast || !!more;
   }
 
   // ------------------------------ panel -----------------------------------
@@ -660,10 +669,29 @@ Here's my profile: https://x.com/Gauransh20`,
               panel(`Scrolling… ${cards.length} cards loaded<br>oldest: ${oldest}`);
               say(`scrolling… ${cards.length} cards loaded, oldest: ${oldest}`);
             }
-            const more = await loadMore(!startReached || !announced);
+            const more = await loadMore(!startReached || !announced, stale > 0);
             const cardsAfter = getCards().length;
             stale = (more || cardsAfter > cards.length) ? 0 : stale + 1;
-            if (stale >= 4) {
+            if (stale === 0 && run.scrollStalls) { run.scrollStalls = 0; saveRun(run); }
+            if (stale > 0 && stale < 8) {
+              // LinkedIn can be slow to load the next page — wait longer each time before retrying.
+              const secs = [3, 5, 8, 12, 15, 20, 25][stale - 1];
+              _scroller = null;   // re-find the scroll container in case the page re-rendered
+              say(`   list didn't grow (try ${stale}/7) — waiting ${secs}s and scrolling again…`);
+              await pauseFor(secs * 1000, `List is loading slowly · try ${stale}/7`);
+              continue;
+            }
+            if (stale >= 8) {
+              run.scrollStalls = (run.scrollStalls || 0) + 1;
+              saveRun(run);
+              if (FROM_EXT && run.scrollStalls <= 2) {
+                say('   list stopped loading — taking a break, then reloading and scrolling again.');
+                const r = await rateBreak();
+                if (r !== 'continue') break;
+                stale = 0;
+                continue;
+              }
+              run.scrollStalls = 0; saveRun(run);
               if (!startReached) say(`🛑 Couldn't find "${START_NAME}" in the list — check the spelling in the "Start from" box.`);
               else say('No more connections to load. Done.');
               break;

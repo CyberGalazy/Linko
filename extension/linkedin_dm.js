@@ -53,7 +53,7 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v14.2';
+  const VERSION = 'v14.3';
   const MEM_RELOAD_EVERY = 40;          // reload the page after this many sends to free memory
   const heap = () => (performance.memory ? performance.memory : null);
   const heapMB = () => { const m = heap(); return m ? Math.round(m.usedJSHeapSize / 1048576) : 0; };
@@ -352,6 +352,39 @@ Here's my profile: https://x.com/Gauransh20`,
     return hit ? 'LinkedIn shows: ' + hit : null;
   }
 
+
+  // ------------------------- already-sent detection ------------------------
+  // The whole chat pop-up for this box: the highest ancestor that still holds only this one
+  // message box (crossing shadow roots), stopping before the page itself.
+  function conversationRoot(box) {
+    const bubble = box.closest('.msg-overlay-conversation-bubble');
+    if (bubble) return bubble;
+    let best = box.parentElement || box, e = box;
+    for (let i = 0; i < 15; i++) {
+      let p = e.parentElement;
+      if (!p) { const h = e.getRootNode && e.getRootNode().host; if (!h) break; p = h; }
+      if (p === document.body || p === document.documentElement || p.tagName === 'MAIN') break;
+      if (p.querySelector('#dm-x-panel') || p.querySelectorAll(BOX_SEL).length > 1) break;
+      best = p; e = p;
+    }
+    return best;
+  }
+  const squash = t => (t || '').replace(/ /g, ' ').replace(/\s+/g, ' ').toLowerCase();
+  // Two things to look for: the link, and a phrase from the message (greeting removed).
+  function sentMarkers() {
+    const msg = settings().message;
+    const longest = msg.split('\n').map(l => l.trim()).sort((a, b) => b.length - a.length)[0] || '';
+    const phrase = squash(longest.replace(/^(hey|hi|hello)( there)?[!,.]?\s*/i, '')).slice(0, 40);
+    return [squash(fingerprint()), phrase].filter(x => x && x.length >= 8);
+  }
+  function threadTextOf(root, box) {
+    let t = root.innerText || '';
+    for (const b of root.querySelectorAll(BOX_SEL)) if (b.innerText) t = t.replace(b.innerText, '');
+    if (box && box.innerText) t = t.replace(box.innerText, '');
+    return squash(t);
+  }
+  const alreadySentIn = (root, box) => { const t = threadTextOf(root, box); return sentMarkers().some(m => t.includes(m)); };
+
   let loggedClick = false;
   async function messageCard(card) {
     const path = location.pathname;
@@ -381,10 +414,24 @@ Here's my profile: https://x.com/Gauransh20`,
     if (result.nav) throw Object.assign(new Error('Message opened a new page instead of the chat pop-up — a console script cannot follow page changes.'), { fatal: true });
     if (result.inmail) { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); throw new Error('needs InMail/Premium'); }
 
-    const { scope, box } = result;
-    await sleep(rand(400, 900)); // let the thread load
-    const threadText = scope.innerText.replace(boxText(box), '');
-    if (threadText.includes(fingerprint()) && !sendFailedIn(scope)) { await closeBubble(scope); return 'skipped-existing'; }
+    const { box } = result;
+    const scope = conversationRoot(box);
+    // Wait for the conversation history to load before deciding whether we already sent it.
+    let seen = false, lastLen = -1, stableSince = Date.now();
+    const tOpen = Date.now();
+    while (Date.now() - tOpen < 6000) {
+      if (alreadySentIn(scope, box)) { seen = true; break; }
+      const len = threadTextOf(scope, box).length;
+      if (len !== lastLen) { lastLen = len; stableSince = Date.now(); }
+      else if (Date.now() - tOpen > 2500 && Date.now() - stableSince > 2000) break;
+      await sleep(300);
+    }
+    if (seen && !sendFailedIn(scope)) {
+      say('   already messaged — skipped');
+      await closeBubble(scope);
+      return 'skipped-existing';
+    }
+    say(`   no earlier message found (checked ${Math.max(lastLen, 0)} chars)`);
     const failedBefore = sendFailedIn(scope);
 
     if (!(await pasteMessage(box))) throw new Error('could not insert message text');
@@ -406,13 +453,9 @@ Here's my profile: https://x.com/Gauransh20`,
     // LinkedIn often swaps the "new message" pop-up for a fresh conversation pop-up after the
     // first send, detaching our box/scope — so check live pop-ups too, and the network.
     const FP = fingerprint();
-    const liveScopes = () => scope.isConnected ? [scope] : [...new Set([...bubbles(), ...allBoxes(true).map(scopeOf)])];
+    const liveScopes = () => scope.isConnected ? [scope] : [...new Set([...bubbles(), ...allBoxes(true).map(conversationRoot)])];
     const leftComposer = () => !box.isConnected || !boxText(box).includes(FP);
-    const inThread = sc => {
-      let t = sc.innerText || '';
-      for (const b of sc.querySelectorAll(BOX_SEL)) t = t.replace(b.innerText || '', '');
-      return t.includes(FP);
-    };
+    const inThread = sc => alreadySentIn(sc, null);
     const confirmed = await waitFor(() => sentSince(tSend) ? 'network'
       : (leftComposer() && liveScopes().some(inThread)) ? 'dom' : null, 15000, 250);
     // A failed message still shows in the thread, so watch a few seconds for LinkedIn's failure marker.

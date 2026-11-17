@@ -21,10 +21,8 @@ Here's my profile: https://x.com/Gauransh20`,
     BREAK_MINUTES: [5, 10],            // …of this many minutes
     VARY_GREETING: true,               // swap the opening 'Hey!' for Hi!/Hey there!/Hi there! at random
     LIMIT: Infinity,                   // max DMs this run (dry run is capped at 3 automatically)
-    DRY_RUN: false,
-    USE_SEARCH: true,                  // reach people via the "Search by name" box instead of scrolling
-    QUEUE_AHEAD: 400,                  // when collecting the list, gather this many people past the bookmark
-    QUEUE_MIN: 25,                     // collect more when fewer than this are left                     // true = paste but DON'T send. Set false to go live.
+    DRY_RUN: false,                    // true = paste but DON'T send. Set false to go live.
+    MODE: 'sweep',                     // 'sweep' = search "aa","ab",… in the Search-by-name box; 'scroll' = old list walk
   };
   // ========================================================================
 
@@ -37,6 +35,7 @@ Here's my profile: https://x.com/Gauransh20`,
       message: typeof v.message === 'string' && v.message.trim() ? v.message : CONFIG.MESSAGE,
       startName: typeof v.startName === 'string' ? v.startName : CONFIG.START_NAME,
       startDate: v.startDate || CONFIG.START_DATE,
+      query: typeof v.query === 'string' && v.query.trim() ? v.query.trim().toLowerCase() : 'aa',
       startUrl: v.startUrl || '',     // bookmark: exact profile URL of the start person
       after: !!v.after,               // true = skip the bookmark person, begin with the next one
     };
@@ -54,7 +53,7 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v13';
+  const VERSION = 'v14';
   const MEM_RELOAD_EVERY = 40;          // reload the page after this many sends to free memory
   const heap = () => (performance.memory ? performance.memory : null);
   const heapMB = () => { const m = heap(); return m ? Math.round(m.usedJSHeapSize / 1048576) : 0; };
@@ -466,12 +465,13 @@ Here's my profile: https://x.com/Gauransh20`,
   }
 
 
-  // ------------------------- queue + search box ---------------------------
-  // The list order is saved once (dmXQueue); afterwards each person is reached by typing
-  // their name in the connections "Search by name" box, so we never re-scroll 1000+ cards.
-  const QUEUE_KEY = 'dmXQueue';
-  const loadQueue = () => { try { const q = JSON.parse(localStorage.getItem(QUEUE_KEY)); if (q && Array.isArray(q.items)) return q; } catch {} return { items: [], complete: false }; };
-  const saveQueue = q => localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  // ---------------------------- search sweep ------------------------------
+  // Instead of scrolling 1000+ connections, search "aa", "ab", … "zz" in the connections
+  // "Search by name" box and message whoever each search shows. One request per search.
+  const LETTERS = 'abcdefghijklmnopqrstuvwxyz';
+  const QUERIES = [...LETTERS].flatMap(a => [...LETTERS].map(b => a + b));
+  // Index to resume at for a typed query: exact match, else the first combo after it alphabetically.
+  const queryIndex = q => { const i = QUERIES.indexOf(q); if (i >= 0) return i; const j = QUERIES.findIndex(x => x > q); return j < 0 ? QUERIES.length : j; };
 
   function findSearchBox() {
     const bad = 'header, nav, #global-nav, .global-nav, .search-global-typeahead, #dm-x-panel, [role="banner"]';
@@ -485,33 +485,45 @@ Here's my profile: https://x.com/Gauransh20`,
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(inp, v);
     inp.dispatchEvent(new Event('input', { bubbles: true }));
   }
-  // Card for one profile URL, found by its link (works whether or not "Connected on" is shown).
-  function cardByUrl(url, fallback) {
-    const hit = getCards().find(c => c.url === url);
-    if (hit) return hit;
-    for (const a of document.querySelectorAll('a[href*="/in/"]')) {
-      if (normUrl(a.getAttribute('href')) !== url || a.closest('#dm-x-panel')) continue;
+  // People currently shown. Uses the "Connected on" cards, else any profile link with a Message button.
+  function resultCards() {
+    const cards = getCards();
+    if (cards.length) return cards;
+    const out = [], seen = new Set();
+    for (const a of document.querySelectorAll('main a[href*="/in/"], a[href*="/in/"]')) {
+      if (a.closest('#dm-x-panel, header, nav, #global-nav, .msg-overlay-container, aside')) continue;
+      const url = normUrl(a.getAttribute('href'));
+      if (seen.has(url)) continue;
       for (let el = a.parentElement, i = 0; el && i < 12; el = el.parentElement, i++) {
         const msg = [...el.querySelectorAll('button, a')].find(isMsgCtl);
-        if (msg) return { el, msg, url, name: fallback.name, text: fallback.text || '', date: fallback.date ? new Date(fallback.date) : null };
+        if (msg) {
+          seen.add(url);
+          const name = (a.innerText || '').split('\n').map(x => x.trim()).filter(Boolean)[0] ||
+                       (msg.getAttribute('aria-label') || '').replace(/^(send a )?message( to)?\s*/i, '');
+          out.push({ el, msg, url, name, text: '', date: null });
+          break;
+        }
       }
     }
-    return null;
+    return out;
   }
-  async function clearSearch() {
+  // Paste the whole query at once (a single search request), then wait for the results to settle.
+  async function runSearch(q) {
     const box = findSearchBox();
-    if (box && box.value) { setInputValue(box, ''); await sleep(rand(1200, 2000)); }
-  }
-  async function searchFor(t) {
-    const box = findSearchBox();
-    if (!box) return null;
+    if (!box) return false;
     realClick(box); box.focus();
-    await sleep(rand(200, 400));
-    if (box.value) { setInputValue(box, ''); await sleep(rand(300, 600)); }
-    const q = t.name.replace(/[^\p{L}\p{N}\s.'-]/gu, ' ').replace(/\s+/g, ' ').trim();
-    for (let i = 1; i <= q.length; i++) { setInputValue(box, q.slice(0, i)); await sleep(rand(40, 110)); }
-    box.dispatchEvent(new KeyboardEvent('keyup', { key: q.slice(-1), bubbles: true }));
-    return await waitFor(() => cardByUrl(t.url, t), 10000, 300);
+    await sleep(rand(300, 600));
+    setInputValue(box, q);
+    await sleep(800);
+    let sig = '', stableSince = Date.now();
+    const end = Date.now() + 8000;
+    while (Date.now() < end) {
+      const now = resultCards().map(c => c.url).join('|');
+      if (now !== sig) { sig = now; stableSince = Date.now(); }
+      else if (Date.now() - stableSince > 1500) break;
+      await sleep(300);
+    }
+    return true;
   }
 
   // ------------------------------ panel -----------------------------------
@@ -531,6 +543,7 @@ Here's my profile: https://x.com/Gauransh20`,
     ui.msg = el('textarea', { id: 'dm-x-msg', rows: 6, style: inp + ';resize:vertical;white-space:pre-wrap;font:12px/1.35 system-ui' });
     ui.fp = el('div', { style: 'opacity:.5;font-size:10px;margin:-4px 0 6px;word-break:break-all' });
     ui.reset = el('a', { href: '#', textContent: 'reset', style: 'float:right;color:#8ab4f8;font-size:11px' });
+    ui.query = el('input', { id: 'dm-x-query', type: 'text', placeholder: 'aa', style: inp });
     ui.name = el('input', { id: 'dm-x-name', type: 'text', placeholder: 'e.g. Jane Doe (blank = first on/before date)', style: inp });
     ui.date = el('input', { id: 'dm-x-date', type: 'date', style: inp });
     ui.text = el('div', { id: 'dm-x-text' });
@@ -538,7 +551,9 @@ Here's my profile: https://x.com/Gauransh20`,
     ui.stop = el('button', { id: 'dm-x-stop', type: 'button', textContent: 'Stop', style: btn + ';background:#c62828' });
     const form = el('div', { id: 'dm-x-form', style: 'margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #333' }, [
       el('div', { style: 'opacity:.75' }, [ui.reset, 'Message']), ui.msg, ui.fp,
-      el('div', { textContent: 'Start from (name)', style: 'opacity:.75' }), ui.name,
+      ...(CONFIG.MODE === 'sweep'
+        ? [el('div', { textContent: 'Search from (letters, e.g. aa)', style: 'opacity:.75' }), ui.query]
+        : [el('div', { textContent: 'Start from (name)', style: 'opacity:.75' }), ui.name]),
       el('div', { textContent: 'Connected on/before', style: 'opacity:.75' }), ui.date,
     ]);
     const ver = el('div', { textContent: VERSION, style: 'position:absolute;top:4px;right:8px;opacity:.4;font-size:10px' });
@@ -560,6 +575,8 @@ Here's my profile: https://x.com/Gauransh20`,
       saveSettings({ ...settings(), message: '' });
       showFp();
     });
+    ui.query.value = st.query;
+    ui.query.addEventListener('input', () => saveSettings({ ...settings(), query: ui.query.value.trim().toLowerCase() }));
     ui.name.value = st.startName || '';
     ui.date.value = st.startDate || '';
     // Typing a name by hand means "start AT this person" — drop the auto bookmark.
@@ -579,7 +596,7 @@ Here's my profile: https://x.com/Gauransh20`,
     for (const t of ['keydown', 'keypress', 'keyup'])  // (not 'input' — we need that one ourselves)
       window.addEventListener(t, e => {
         const id = e.target && e.target.id;
-        if (id === 'dm-x-name' || id === 'dm-x-date' || id === 'dm-x-msg') e.stopImmediatePropagation();
+        if (id === 'dm-x-name' || id === 'dm-x-date' || id === 'dm-x-msg' || id === 'dm-x-query') e.stopImmediatePropagation();
       }, true);
   }
   function panel(text) {
@@ -595,7 +612,7 @@ Here's my profile: https://x.com/Gauransh20`,
     });
   }
   function lockForm(on) {
-    for (const e of [ui.msg, ui.name, ui.date, ui.start]) {
+    for (const e of [ui.msg, ui.query, ui.name, ui.date, ui.start]) {
       if (e) { e.disabled = on; e.style.opacity = on ? '.5' : '1'; }
     }
   }
@@ -621,13 +638,14 @@ Here's my profile: https://x.com/Gauransh20`,
       START = new Date(st.startDate + 'T23:59:59');
       const START_NAME = st.startName;
       // With a name, start at that person whatever their date, and take everyone below them.
-      const eligible = c => START_NAME ? true : !!(c.date && c.date <= START);
+      const eligible = c => START_NAME && CONFIG.MODE !== 'sweep' ? true : !!(c.date && c.date <= START);
       const START_URL = START_NAME ? st.startUrl : '';
       const START_AFTER = !!(START_URL || START_NAME) && st.after;
       let startReached = !START_NAME;
       // Move the "Start from" bookmark as we go, so a reload / restart continues from here.
       const bookmark = (c, after) => {
         if (c.el) lighten(c.el);
+        if (CONFIG.MODE === 'sweep') return;     // sweep mode resumes by search query instead
         saveSettings({ ...settings(), startName: c.name, startUrl: c.url, after });
         if (ui.name) ui.name.value = c.name;
       };
@@ -673,74 +691,12 @@ Here's my profile: https://x.com/Gauransh20`,
         }
         return 'continue';
       };
-      // ---- queue helpers (search mode) ----
-      const queue = loadQueue();
-      const targetsAfterBookmark = () => {
-        const s2 = settings();
-        let i = 0;
-        if (START_NAME) {
-          const at = s2.startUrl ? queue.items.findIndex(x => x.url === s2.startUrl)
-                                 : queue.items.findIndex(x => norm(x.name) === norm(s2.startName));
-          if (at < 0) return null;                       // bookmark not collected yet
-          i = s2.after && (s2.startUrl || s2.startName) ? at + 1 : at;
-        }
-        return queue.items.slice(i).filter(x => !log[x.url] && !tried.has(x.url) &&
-          (START_NAME || (x.date && new Date(x.date) <= START)));
-      };
-      // Scroll the list once and record people in order. Returns 'ok', 'reload' or 'stop'.
-      const harvest = async () => {
-        await clearSearch();
-        const known = new Set(queue.items.map(x => x.url));
-        let stall = 0, rounds = 0;
-        say(`Collecting the list (${queue.items.length} saved so far)…`);
-        while (this.running) {
-          if (rateLimited()) return (await rateBreak()) === 'continue' ? 'ok' : 'reload';
-          const cards = getCards();
-          let lastKnown = -1;
-          cards.forEach((c, i) => { if (known.has(c.url)) lastKnown = i; });
-          let added = 0;
-          cards.forEach((c, i) => {
-            lighten(c.el);
-            if (i > lastKnown && !known.has(c.url)) {
-              known.add(c.url); added++;
-              queue.items.push({ url: c.url, name: c.name, text: c.text, date: c.date ? c.date.toISOString() : null });
-            }
-          });
-          if (added) { saveQueue(queue); if (run.scrollStalls) { run.scrollStalls = 0; saveRun(run); } }
-          const ahead = targetsAfterBookmark();
-          const n = ahead ? ahead.length : 0;
-          panel(`Collecting list… ${queue.items.length} people<br>${ahead ? n + ' queued after ' + (settings().startName || 'the start') : 'looking for ' + START_NAME}${heapMB() ? ' · ' + heapMB() + ' MB' : ''}`);
-          if (++rounds % 5 === 0) say(`   collecting… ${cards.length} loaded on page, ${queue.items.length} saved, ${ahead ? n + ' queued' : 'start person not reached yet'}`);
-          if (ahead && n >= CONFIG.QUEUE_AHEAD) break;
-          const more = await loadMore(true, stall > 0);
-          if (more) { stall = 0; continue; }
-          stall++;
-          if (stall <= 5) { await pauseFor([2, 4, 6, 10, 15][stall - 1] * 1000, `List loading slowly · try ${stall}/5`); continue; }
-          if (ahead && n > 0) break;                     // stalled, but we have people to message
-          if ((run.scrollStalls || 0) < 2) {             // maybe throttled — break, reload, try again
-            run.scrollStalls = (run.scrollStalls || 0) + 1; saveRun(run);
-            say('   list stopped loading — taking a break, then reloading.');
-            return (await rateBreak()) === 'continue' ? 'ok' : 'reload';
-          }
-          run.scrollStalls = 0; saveRun(run);
-          queue.complete = true; saveQueue(queue);       // still nothing after 2 reloads: end of the list
-          say('Reached the end of the connections list.');
-          break;
-        }
-        if (!this.running) return 'stop';
-        // The page now holds a huge list — reload so sending runs on a light page.
-        if (FROM_EXT && getCards().length > 200) {
-          say('List saved — reloading to free memory, then messaging via search…');
-          saveRun({ ...loadRun(), running: true, resumeAt: 0 });
-          reloading = true;
-          setTimeout(() => location.reload(), 300);
-          return 'reload';
-        }
-        return 'ok';
-      };
-      let searchMode = CONFIG.USE_SEARCH && !!(await waitFor(findSearchBox, 8000, 400));
-      if (CONFIG.USE_SEARCH && !searchMode) say('search box not found — using scroll mode (run DM.diagnoseSearch() and send me the output)');
-      let notFound = 0;
+      // ---- sweep state ----
+      let sweep = CONFIG.MODE === 'sweep' && !!(await waitFor(findSearchBox, 8000, 400));
+      if (CONFIG.MODE === 'sweep' && !sweep) say('search box not found — using scroll mode (run DM.diagnoseSearch() and send me the output)');
+      const firstQ = st.query;
+      let qIdx = queryIndex(firstQ), curQuery = null, extraFirst = QUERIES.includes(firstQ) ? null : firstQ, scrollRounds = 0;
+      const setQuery = q => { saveSettings({ ...settings(), query: q }); if (ui.query) ui.query.value = q; };
 
       installRateWatch();
       say(`script ${VERSION}${FROM_EXT ? ' (extension)' : ''} · ${CONFIG.BETWEEN[0]}–${CONFIG.BETWEEN[1]} s pacing · start at ${START_NAME || '(first on/before ' + st.startDate + ')'}`);
@@ -770,31 +726,30 @@ Here's my profile: https://x.com/Gauransh20`,
           }
 
           let card = null;
-          if (searchMode) {
-            let ahead = targetsAfterBookmark();
-            if ((!ahead || ahead.length < CONFIG.QUEUE_MIN) && !queue.complete) {
-              const r = await harvest();
-              if (r !== 'ok') break;
-              ahead = targetsAfterBookmark();
+          if (sweep) {
+            const q = extraFirst || QUERIES[qIdx];
+            if (!q) { say('Searched every letter combination (aa–zz). Done.'); break; }
+            if (curQuery !== q) {
+              setQuery(q);
+              panel(`Searching "${q}" (${Math.min(qIdx + 1, QUERIES.length)}/${QUERIES.length})<br>sent ${sent}`);
+              if (!(await runSearch(q))) { say('🛑 Search box disappeared — reload the page.'); break; }
+              curQuery = q; scrollRounds = 0;
+              const n = resultCards().length;
+              say(`search "${q}": ${n} shown`);
             }
-            if (!ahead) { say(`🛑 Couldn't find "${START_NAME}" in the list — check the spelling in the "Start from" box.`); break; }
-            if (!ahead.length) { say('No more people to message. Done.'); break; }
-            const t = ahead[0];
-            panel(`Searching for ${t.name}…<br>sent ${sent} · ${ahead.length} queued`);
-            card = await searchFor(t);
-            if (!card) {
-              notFound++;
-              say(`   ✗ ${t.name}: not found via search — skipping`);
-              tried.add(t.url);
-              log[t.url] = { name: t.name, connected: (t.date || '').slice(0, 10), status: 'not-found', at: new Date().toISOString() };
-              saveLog(log);
-              bookmark(t, true);
-              if (notFound >= 5) { say('🛑 5 people in a row not found via search — run DM.diagnoseSearch() and send me the output.'); break; }
-              await sleep(rand(1500, 3000));
+            const list = resultCards().filter(c => !tried.has(c.url) && !log[c.url] && (!c.date || c.date <= START));
+            if (!list.length) {
+              // Long result list? Scroll inside it a little (max 5 rounds), then go to the next query.
+              if (scrollRounds < 5 && resultCards().length >= 10) {
+                scrollRounds++;
+                if (await loadMore(false)) continue;
+              }
+              if (extraFirst) extraFirst = null; else qIdx++;
+              await pauseFor(rand(3000, 6000), 'Next search');   // keep searches spaced out
               continue;
             }
-            notFound = 0;
-            if (!announced) { announced = true; say(`Messaging via search, starting with ${card.name}.`); }
+            card = list[0];
+            if (!announced) { announced = true; say(`Sweeping searches from "${q}", starting with ${card.name}.`); }
           } else {
           const cards = getCards();
           if (!startReached) {
@@ -958,8 +913,6 @@ Here's my profile: https://x.com/Gauransh20`,
       return loadLog();
     },
     resetLog() { localStorage.removeItem(LOG_KEY); say('Log cleared.'); },
-    resetQueue() { localStorage.removeItem(QUEUE_KEY); say('Saved list cleared — it will be collected again on next Start.'); },
-    queueInfo() { const q = loadQueue(); say(`Saved list: ${q.items.length} people${q.complete ? ' (complete)' : ''}. First: ${q.items[0] && q.items[0].name}, last: ${q.items.length ? q.items[q.items.length - 1].name : '-'}`); return q; },
     diagnoseSearch() {
       console.table([...document.querySelectorAll('input')].map(i => ({ type: i.type, placeholder: i.placeholder,
         aria: i.getAttribute('aria-label'), visible: visible(i), inHeader: !!i.closest('header, nav, #global-nav, [role="banner"]'),

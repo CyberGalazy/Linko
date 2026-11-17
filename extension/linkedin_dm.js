@@ -53,7 +53,7 @@ Here's my profile: https://x.com/Gauransh20`,
   const STOP_TEXTS = [/weekly limit/i, /reached the limit/i, /security check/i, /unusual activity/i,
                       /temporarily restricted/i];
 
-  const VERSION = 'v14';
+  const VERSION = 'v14.1';
   const MEM_RELOAD_EVERY = 40;          // reload the page after this many sends to free memory
   const heap = () => (performance.memory ? performance.memory : null);
   const heapMB = () => { const m = heap(); return m ? Math.round(m.usedJSHeapSize / 1048576) : 0; };
@@ -474,6 +474,10 @@ Here's my profile: https://x.com/Gauransh20`,
   const queryIndex = q => { const i = QUERIES.indexOf(q); if (i >= 0) return i; const j = QUERIES.findIndex(x => x > q); return j < 0 ? QUERIES.length : j; };
 
   function findSearchBox() {
+    // LinkedIn's connections search: <input data-testid="typeahead-input" placeholder="Search your connections">
+    const exact = [...document.querySelectorAll('input[placeholder*="your connections" i], input[aria-label*="your connections" i]')]
+      .find(i => visible(i) && !i.closest('#dm-x-panel'));
+    if (exact) return exact;
     const bad = 'header, nav, #global-nav, .global-nav, .search-global-typeahead, #dm-x-panel, [role="banner"]';
     const cands = [...document.querySelectorAll('input')].filter(i =>
       visible(i) && /^(text|search|)$/i.test(i.type || '') && !i.closest(bad));

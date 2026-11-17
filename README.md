@@ -37,5 +37,7 @@ It sends one DM every 45–90 seconds, with a 5–10 min break every 15 sends. I
 - `DM.exportLog()`: copy the list of people already messaged
 - `DM.resetLog()`: clear that list
 - `DM.resetRun()`: clear the pause/reload history
+- `DM.queueInfo()` / `DM.resetQueue()`: show or clear the saved list order (people are reached via the "Search by name" box, so the list is scrolled only once)
+- `DM.diagnoseSearch()`: list the page's input boxes if the search box isn't found
 
 Keep the tab in front while it runs. Chrome slows scripts down in background tabs.
